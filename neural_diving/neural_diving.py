@@ -1,101 +1,258 @@
 import torch.nn as nn
 from torch_geometric.nn import GCNConv
 import torch
+import torch
+import torch.nn as nn
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import add_self_loops
+
+# 自定义带权GCN层（支持边特征）
+class WeightedGCNConv(MessagePassing):
+    def __init__(self, in_channels, out_channels):
+        super().__init__(aggr='add')  # 使用加法聚合
+        self.lin = nn.Linear(in_channels, out_channels)
+        self.edge_lin = nn.Linear(1, out_channels, bias=False)  # 边权重变换
+
+    def forward(self, x, edge_index, edge_attr):
+        # 添加自环
+        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+        
+        # 线性变换节点特征
+        x = self.lin(x)
+        
+        # 传播带权消息
+        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
+
+    def message(self, x_j, edge_attr):
+        # x_j: 邻居节点特征 [E, out_channels]
+        # edge_attr: 边权重 [E, 1]
+        return x_j + self.edge_lin(edge_attr)  # 结合边权重
+
 class NeuralDivingModel(nn.Module):
-    def __init__(self, input_dim=4, hidden_dim=128):
+    def __init__(self, var_feat_dim=4, cons_feat_dim=4, hidden_dim=128, num_layers=3):
         super().__init__()
-        # 第一层GCN
-        self.conv1 = GCNConv(input_dim, hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
         
-        # 第二层GCN（带残差连接）
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        # 初始化变量和约束的特征编码器
+        self.var_encoder = nn.Linear(var_feat_dim, hidden_dim)
+        self.cons_encoder = nn.Linear(cons_feat_dim, hidden_dim)
         
-        # 变量选择器
+        # 多层GCN结构
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        for _ in range(num_layers):
+            self.convs.append(WeightedGCNConv(hidden_dim, hidden_dim))
+            self.norms.append(nn.LayerNorm(hidden_dim))
+        
+        # 跳跃连接累积维度
+        self.hidden_dims = [hidden_dim * (i+1) for i in range(num_layers)]
+        
+        # SelectiveNet组件
         self.selector = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(self.hidden_dims[-1], 1),
             nn.Sigmoid()
         )
         
-        # 变量赋值预测器
-        self.predictor = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
+        # 预测器（处理二元和整数变量）
+        self.binary_predictor = nn.Sequential(
+            nn.Linear(self.hidden_dims[-1], 1),
             nn.Sigmoid()
         )
-        
+        self.integer_predictor = nn.Sequential(  # 整数变量位预测
+            nn.Linear(self.hidden_dims[-1], 4),  # 预测最高4位
+            nn.Sigmoid()
+        )
+
     def forward(self, data):
-        x, edge_index = data.x, data.edge_index
+        # 分离变量和约束节点特征
+        var_feats = data.x[:data.num_vars]
+        cons_feats = data.x[data.num_vars:]
         
-        # 第一层GCN
-        x = self.conv1(x, edge_index)
-        x = self.norm1(x)
-        x = torch.relu(x)
+        # 初始编码
+        x_var = self.var_encoder(var_feats)  # [num_vars, hidden]
+        x_cons = self.cons_encoder(cons_feats)  # [num_cons, hidden]
+        x = torch.cat([x_var, x_cons], dim=0)  # [num_nodes, hidden]
         
-        # 第二层GCN
-        residual = x
-        x = self.conv2(x, edge_index) + residual
-        x = self.norm2(x)
-        x = torch.relu(x)
+        # 存储各层特征用于跳跃连接
+        layer_outputs = [x]
         
-        # 分离变量节点
-        var_nodes = x[:data.num_vars]
+        # 多層GCN處理
+        for conv, norm in zip(self.convs, self.norms):
+            # 消息传递（带边权重）
+            x = conv(x, data.edge_index, data.edge_attr)
+            
+            # 跳跃连接：与之前所有层拼接
+            x = torch.cat([x] + layer_outputs, dim=1)  # [num_nodes, hidden*(layer+1)]
+            
+            # 层归一化
+            x = norm(x)
+            x = torch.relu(x)
+            
+            layer_outputs.append(x)
         
-        # 预测选择概率和赋值概率
-        selection_probs = self.selector(var_nodes)
-        assignment_probs = self.predictor(var_nodes)
+        # 最终变量节点特征
+        var_features = x[:data.num_vars]  # [num_vars, total_hidden]
         
+        # 选择性覆盖预测
+        selection_probs = self.selector(var_features)  # [num_vars, 1]
+        
+        # 变量赋值预测
+        binary_mask = data.var_types == 'binary'  # 假设data包含变量类型信息
+        assignment_probs = torch.zeros_like(selection_probs)
+        
+        # 二元变量预测
+        assignment_probs[binary_mask] = self.binary_predictor(
+            var_features[binary_mask]
+        )
+        
+        # 整数变量位预测
+        if not torch.all(binary_mask):
+            integer_probs = self.integer_predictor(
+                var_features[~binary_mask]
+            )  # [num_integer_vars, 4]
+            assignment_probs[~binary_mask] = integer_probs.mean(dim=1, keepdim=True)
+
         return selection_probs.squeeze(), assignment_probs.squeeze()
+
+    # 新增SelectiveNet损失函数
+    def selective_loss(self, selection_probs, assignment_probs, targets, coverage_target=0.7):
+        # 选择损失
+        selection_loss = -torch.mean(targets * torch.log(selection_probs + 1e-8))
+        
+        # 覆盖率惩罚
+        coverage = torch.mean(selection_probs)
+        penalty = torch.relu(coverage_target - coverage)**2
+        
+        # 总损失
+        total_loss = selection_loss + 0.1 * penalty
+        return total_loss
     
 class NeuralDivingTrainer:
-    def __init__(self, model, lr=1e-4):
+    def __init__(self, model, lr=1e-4, coverage_target=0.7, lambda_penalty=0.1):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        self.loss_fn = nn.BCELoss()
+        self.coverage_target = coverage_target
+        self.lambda_penalty = lambda_penalty
         
-    def train_step(self, data, solutions, weights):
-        """单次训练步骤"""
-        # 前向传播
-        select_probs, assign_probs = self.model(data)
+    def weighted_bce(self, pred, target, weights):
+        """带权重的二元交叉熵损失"""
+        loss = - (weights * (target * torch.log(pred + 1e-8) + 
+                 (1 - target) * torch.log(1 - pred + 1e-8))
+        return loss.mean()
+    
+    def train_step(self, batch_data, batch_solutions):
+        """
+        batch_data: 包含多个MIP实例的批处理数据（使用PyG的Batch对象）
+        batch_solutions: 每个MIP对应的解列表 [
+            { 
+                'selected': [variable选择掩码], 
+                'values': [变量赋值], 
+                'obj_value': 解的客观值
+            }, 
+            ...
+        ]
+        """
+        # 前向传播 --------------------------------------------------------
+        select_probs, assign_probs = self.model(batch_data)
         
-        # 转换目标数据为张量 --------------------------------------------------
-        # 获取变量总数
-        num_vars = data.num_vars  
+        # 准备目标数据 ----------------------------------------------------
+        batch_size = batch_data.num_graphs  # 获取批次中的MIP数量
+        num_vars = batch_data.num_vars // batch_size  # 假设每个MIP变量数相同
         
-        # 构造二进制掩码矩阵 [num_samples, num_vars]
-        selected_vars = torch.zeros(len(solutions), num_vars, dtype=torch.float32)
-        assignments = torch.zeros(len(solutions), num_vars, dtype=torch.float32)
+        # 初始化目标张量
+        selected_targets = []
+        assign_targets = []
+        obj_values = []
         
-        for i, sol in enumerate(solutions):
-            # selected字段应当是二进制掩码（已修改数据采集逻辑）
-            selected_vars[i] = torch.tensor(sol['selected'], dtype=torch.float32)
+        # 遍历每个MIP及其解
+        for mip_idx in range(batch_size):
+            solutions = batch_solutions[mip_idx]
             
-            # values字段应当是全量赋值（包括未选中变量）
-            assignments[i] = torch.tensor(sol['values'], dtype=torch.float32)
+            # 合并同一MIP的多个解
+            for sol in solutions:
+                # 选择掩码 (shape: [num_vars])
+                selected = torch.tensor(sol['selected'], dtype=torch.float32)
+                # 赋值目标 (shape: [num_vars])
+                values = torch.tensor(sol['values'], dtype=torch.float32)
+                # 解的客观值
+                obj = sol['obj_value']
+                
+                selected_targets.append(selected)
+                assign_targets.append(values)
+                obj_values.append(obj)
         
-        # 转移到GPU（如果使用）
-        selected_vars = selected_vars.to(select_probs.device)
-        assignments = assignments.to(assign_probs.device)
+        # 转换为张量并移动到设备
+        selected_targets = torch.stack(selected_targets).to(select_probs.device)  # [total_solutions, num_vars]
+        assign_targets = torch.stack(assign_targets).to(select_probs.device)
+        obj_values = torch.tensor(obj_values).to(select_probs.device)
         
-        # 维度调整 ---------------------------------------------------------
-        # 模型输出形状 [num_vars] -> 扩展为 [1, num_vars] 以匹配批量维度
-        select_probs = select_probs.unsqueeze(0)  # 假设每次处理单个问题多个解
-        assign_probs = assign_probs.unsqueeze(0)
+        # 计算样本权重（式12）----------------------------------------------
+        weights = torch.exp(-obj_values)  # 假设最小化问题，目标值越小权重越高
+        weights /= weights.sum()  # 归一化
         
-        # 计算损失 ---------------------------------------------------------
-        select_loss = self.loss_fn(select_probs, selected_vars)
-        assign_loss = self.loss_fn(assign_probs, assignments)
+        # 分离变量类型 ----------------------------------------------------
+        is_binary = batch_data.var_type == 'binary'  # [total_vars_in_batch]
+        is_integer = ~is_binary
         
-        # 加权总损失
-        total_loss = weights[0]*select_loss + weights[1]*assign_loss
+        # 分割预测结果（假设assign_probs包含两个部分）
+        binary_probs = assign_probs[is_binary]  # 二进制变量预测
+        integer_probs = assign_probs[is_integer]  # 整数变量比特预测
+        
+        # 计算选择损失（式16）----------------------------------------------
+        # 选择概率 (shape: [total_solutions, num_vars])
+        selection_loss = self.weighted_bce(
+            select_probs.unsqueeze(0).expand(len(obj_values), -1), 
+            selected_targets,
+            weights.unsqueeze(1)
+        
+        # 覆盖率惩罚项
+        coverage = select_probs.mean()
+        penalty = torch.relu(self.coverage_target - coverage)**2
+        
+        # 总选择损失
+        select_total = selection_loss + self.lambda_penalty * penalty
+        
+        # 计算赋值损失 ----------------------------------------------------
+        # 二进制变量损失
+        binary_targets = assign_targets[:, is_binary]
+        binary_loss = self.weighted_bce(
+            binary_probs.unsqueeze(0).expand(len(obj_values), -1), 
+            binary_targets,
+            weights.unsqueeze(1))
+        
+        # 整数变量比特损失（假设每个比特独立预测）
+        integer_targets = assign_targets[:, is_integer]
+        # 将整数转换为二进制比特（示例：4位）
+        bit_targets = []
+        for val in integer_targets.flatten():
+            bits = [int(b) for b in f"{int(val.item()):04b}"]  # 转换为4位二进制
+            bit_targets.append(bits)
+        bit_targets = torch.tensor(bit_targets).to(integer_probs.device)  # [num_integer_vars * solutions, 4]
+        
+        integer_loss = self.weighted_bce(
+            integer_probs.repeat(len(obj_values), 1),  # 假设每个解预测相同
+            bit_targets,
+            weights.repeat_interleave(is_integer.sum()))
+        
+        # 总赋值损失
+        assign_total = binary_loss + integer_loss
+        
+        # 组合总损失 -----------------------------------------------------
+        total_loss = select_total + assign_total
         
         # 反向传播
         self.optimizer.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)  # 添加梯度裁剪
         self.optimizer.step()
         
-        return total_loss.item()
-    
+        return {
+            'total_loss': total_loss.item(),
+            'select_loss': selection_loss.item(),
+            'assign_loss': assign_total.item(),
+            'coverage': coverage.item()
+        }
+
+  
 from pyscipopt import Model
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict

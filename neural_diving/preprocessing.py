@@ -1,83 +1,128 @@
-import torch
 import numpy as np
-from pyscipopt import Model
+from pyscipopt import Model, Eventhdlr,SCIP_EVENTTYPE
+import os
+import pickle
 from tqdm import tqdm
+from multiprocessing import Pool
 
-def generate_solutions(mps_path, num_samples=100, coverage=0.7):
-    """生成可行解样本（避免死循环版）"""
-    master_model = Model()  # 主模型只读取一次
-    master_model.hideOutput()
-    master_model.readProblem(mps_path)
-    master_model.setParam('limits/time', 60)  # 主模型参数（可选）
+class SolutionCollector(Eventhdlr):
+    def __init__(self, model, mip_path):
+        super().__init__()  # 初始化基类
+        self.model = model
+        self.mip_path = mip_path
+        self.solutions = []
+        self.obj_values = []
+        self.K = 10  # 设定收集解的数量
+        self.model.setIntParam("limits/solutions", self.K)  # 设置最大解数量
+        
+        # 配置求解器参数
+        self.model.setParam("limits/time", 60)
+        self.model.setParam("display/verblevel", 0)
+        self.model.setParam("presolving/maxrestarts", 0)
+        self.model.setParam("limits/gap", 0.0)
+
+        # 注册事件类型（关键修改2）
+        self.model.includeEventhdlr(self, "SolutionCollector", "Collects solutions during optimization")
+
+    def eventinit(self):
+        # 指定监听的事件类型（关键修改3）
+        self.model.catchEvent(SCIP_EVENTTYPE.BESTSOLFOUND, self)
+
+    def eventexit(self):
+        self.model.dropEvent(SCIP_EVENTTYPE.BESTSOLFOUND, self)
+
+    def eventexec(self, event):
+        # 当找到新解时触发
+        if self.model.getNSols() > len(self.solutions):
+            sol = self.model.getBestSol()
+            self.solutions.append(self._get_solution_vector(sol))
+            self.obj_values.append(self.model.getSolObjVal(sol))
+        return {"delay": False}
+
+    def _get_solution_vector(self, sol):
+        # 将解转换为numpy数组（仅整数变量）
+        vars = self.model.getVars()
+        return np.array([self.model.getSolVal(sol, v) for v in vars])
     
-    vars = master_model.getVars()
-    binary_vars = [i for i, var in enumerate(vars) if var.vtype() == 'BINARY']
-    num_binary = len(binary_vars)
-    
-    solutions = []
-    max_attempts = num_samples * 5  # 最大尝试次数
-    attempts = 0
-    current_coverage = coverage
-    consecutive_failures = 0
-    max_consecutive_failures = 20
-    
-    pbar = tqdm(total=num_samples, desc="Generating Solutions")
-    
-    while len(solutions) < num_samples and attempts < max_attempts:
-        attempts += 1
-        
-        # 动态调整覆盖率
-        if consecutive_failures >= max_consecutive_failures:
-            current_coverage = max(0.2, current_coverage - 0.1)
-            consecutive_failures = 0
-            print(f"Adjusted coverage to {current_coverage}")
-        
-        # 通过复制创建子模型
-        sub_model = Model()
-        sub_model.readProblem(mps_path)
-        sub_model.hideOutput()
-        sub_model.setParam('limits/time', 30)  # 更短的求解时间
-        
-        # 随机选择变量并赋值
-        selected = np.random.choice(
-            binary_vars,
-            size=int(current_coverage * num_binary),
-            replace=False
-        )
-        assignments = np.random.randint(2, size=len(selected))
-        
-        # 固定变量值
-        for idx, val in zip(selected, assignments):
-            var = sub_model.getVars()[idx]
-            sub_model.fixVar(var, val)
-        
-        # 求解子问题
-        sub_model.optimize()
-        
-        # 检查解是否存在
-        if sub_model.getNSols() == 0:
-            consecutive_failures += 1
-            continue
-        
-        # 成功获取解
-        try:
-            sol = sub_model.getBestSol()
-            sol_values = [sol[var] for var in sub_model.getVars()]
-        except Exception as e:
-            print(f"Error: {e}")
-            continue
-        
-        # 构建样本
-        sample = {
-            'selected': torch.zeros(len(vars), dtype=torch.float),
-            'values': torch.tensor(sol_values, dtype=torch.float)
+    def _post_process(self):
+        # 去重并计算权重
+        unique_sols, unique_objs = self._remove_duplicates()
+        weights = self._compute_weights(unique_objs)
+        return {
+            'solutions': unique_sols,
+            'objectives': unique_objs,
+            'weights': weights
         }
-        sample['selected'][selected] = 1.0
-        solutions.append(sample)
-        pbar.update(1)
-        consecutive_failures = 0  # 重置失败计数器
+
+    def _remove_duplicates(self):
+        # 基于解的哈希值去重
+        seen = set()
+        unique_sols, unique_objs = [], []
+        for sol, obj in zip(self.solutions, self.obj_values):
+            sol_hash = hash(sol.tobytes())
+            if sol_hash not in seen:
+                seen.add(sol_hash)
+                unique_sols.append(sol)
+                unique_objs.append(obj)
+        return unique_sols, unique_objs
+
+    def _compute_weights(self, objectives):
+        # 计算softmax权重（假设是最小化问题）
+        obj_array = np.array(objectives)
+        shifted_obj = obj_array - np.min(obj_array)  # 数值稳定性处理
+        exp_vals = np.exp(-shifted_obj)
+        return exp_vals / exp_vals.sum()
+
+def process_single_mip(mip_path):
+    print(f"Processing {mip_path}")
     
-    pbar.close()
-    if len(solutions) < num_samples:
-        print(f"Warning: Generated {len(solutions)} solutions (target: {num_samples})")
-    return solutions
+    model = Model()  # 创建独立模型实例
+    collector = SolutionCollector(model, mip_path)  # 关键修改4
+    model.readProblem(mip_path, "mps")
+    model.optimize()
+    result = collector._post_process()
+    return {
+            'instance': os.path.basename(mip_path),
+            'data': result
+    }
+    
+
+if __name__ == "__main__":
+    # 配置参数
+    MIP_DIR = "data"
+    OUTPUT_FILE = "training_data.pkl"
+    NUM_WORKERS = 1  # 并行进程数
+
+    # 获取所有MIP文件路径
+    mip_files = [os.path.join(MIP_DIR, f) for f in os.listdir(MIP_DIR) if f.endswith(".mps")]
+
+    # 并行处理所有MIP实例
+    # with Pool(NUM_WORKERS) as p:
+    #     results = list(tqdm(p.imap(process_single_mip, mip_files), total=len(mip_files)))
+    results = []
+    for mip_path in tqdm(mip_files):
+        result = process_single_mip(mip_path)
+        results.append(result)
+
+    # 过滤失败案例并保存
+    valid_data = [r for r in results if r is not None]
+    with open(OUTPUT_FILE, "wb") as f:
+        pickle.dump(valid_data, f)
+
+    # 打印统计信息
+    total_sols = sum(len(d['data']['solutions']) for d in valid_data)
+    print(f"Collected {total_sols} solutions from {len(valid_data)} instances")
+
+    # 加载保存的数据
+    with open("training_data.pkl", "rb") as f:
+        data = pickle.load(f)
+
+    # 访问第一个实例的数据
+    len_data = len(data)
+    for i in range(len_data):
+        print(f"第{i+1}个实例")
+        first_instance = data[i]
+        print(f"Instance: {first_instance['instance']}")
+        print(f"Solutions: {first_instance['data']['solutions']}")
+        print(f"Objectives: {first_instance['data']['objectives']}")
+        print(f"Weights: {first_instance['data']['weights']}")
