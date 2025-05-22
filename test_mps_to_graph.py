@@ -1,6 +1,6 @@
 import os
 import torch
-from mps_to_graph import mps_to_graph
+from Neural_Lns_RUC.mps_reader import mps_to_graph
 import matplotlib.pyplot as plt
 import networkx as nx
 

@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from scipy.optimize import linprog
-from mps_to_graph import read_mps_file
+from Neural_Lns_RUC.mps_reader import read_mps_file
 from typing import Dict, Tuple, Optional
 
 def solve_mps_with_scipy(file_path: str) -> Dict:

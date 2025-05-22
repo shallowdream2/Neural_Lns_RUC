@@ -74,7 +74,8 @@ def read_mps_file(file_path: str) -> Dict:
                             var_indices[var_name] = len(var_indices)
                             data['var_names'].append(var_name)
                             data['objective'].append(0.0)
-                            data['var_types'].append('integer' if in_integer_section else 'continuous')
+                            # 默认设置为连续变量，后续在BOUNDS部分可能会更新
+                            data['var_types'].append('continuous')
                             data['bounds'].append([0.0, float('inf')])
                             # Initialize constraint matrix row for this variable
                             for i in range(len(data['con_names'])):
@@ -119,34 +120,33 @@ def read_mps_file(file_path: str) -> Dict:
                 elif current_section == 'BOUNDS':
                     # Parse bounds
                     parts = line.split()
-                    if len(parts) >= 4:
+                    if len(parts) >= 3:  # 修改这里，因为BV标记只需要3个部分
                         bound_type = parts[0]
-                        var_name = parts[2]
-                        try:
-                            value = float(parts[3]) if len(parts) > 3 else None
+                        var_name = parts[2]  # 变量名在第3个位置
+                        
+                        if var_name in var_indices:
+                            var_idx = var_indices[var_name]
                             
-                            if var_name in var_indices:
-                                var_idx = var_indices[var_name]
-                                
-                                if bound_type == 'LO':
-                                    data['bounds'][var_idx][0] = value
-                                elif bound_type == 'UP':
-                                    data['bounds'][var_idx][1] = value
-                                elif bound_type == 'FX':
-                                    data['bounds'][var_idx] = [value, value]
-                                elif bound_type == 'FR':
-                                    data['bounds'][var_idx] = [float('-inf'), float('inf')]
-                                elif bound_type == 'BV':
-                                    data['bounds'][var_idx] = [0.0, 1.0]
-                                    data['var_types'][var_idx] = 'binary'
-                                elif bound_type == 'LI':
-                                    data['bounds'][var_idx][0] = value
-                                    data['var_types'][var_idx] = 'integer'
-                                elif bound_type == 'UI':
-                                    data['bounds'][var_idx][1] = value
-                                    data['var_types'][var_idx] = 'integer'
-                        except ValueError:
-                            continue
+                            if bound_type == 'BV':
+                                # 处理二进制变量
+                                data['bounds'][var_idx] = [0.0, 1.0]
+                                data['var_types'][var_idx] = 'binary'
+                                print(f"设置变量 {var_name} 为二进制变量")
+                            elif bound_type == 'LO':
+                                data['bounds'][var_idx][0] = float(parts[3])
+                            elif bound_type == 'UP':
+                                data['bounds'][var_idx][1] = float(parts[3])
+                            elif bound_type == 'FX':
+                                value = float(parts[3])
+                                data['bounds'][var_idx] = [value, value]
+                            elif bound_type == 'FR':
+                                data['bounds'][var_idx] = [float('-inf'), float('inf')]
+                            elif bound_type == 'LI':
+                                data['bounds'][var_idx][0] = float(parts[3])
+                                data['var_types'][var_idx] = 'integer'
+                            elif bound_type == 'UI':
+                                data['bounds'][var_idx][1] = float(parts[3])
+                                data['var_types'][var_idx] = 'integer'
     except Exception as e:
         print(f"Error reading file {file_path} at line {line_num}: {str(e)}")
         print(f"Current section: {current_section}")
@@ -171,6 +171,11 @@ def read_mps_file(file_path: str) -> Dict:
     data['rhs'] = np.array(data['rhs'])
     data['bounds'] = np.array(data['bounds'])
     
+    # 打印变量类型信息用于调试
+    print("\n变量类型信息:")
+    for i, (name, type_) in enumerate(zip(data['var_names'], data['var_types'])):
+        print(f"变量 {name}: 类型 = {type_}, 边界 = {data['bounds'][i]}")
+    
     return data
 
 def create_bipartite_graph(mps_data: Dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -191,6 +196,10 @@ def create_bipartite_graph(mps_data: Dict) -> Tuple[torch.Tensor, torch.Tensor, 
         n_vars = len(mps_data['objective'])
         n_cons = len(mps_data['rhs'])
         
+        print(f"变量数量: {n_vars}")
+        print(f"变量类型: {mps_data['var_types']}")
+        print(f"变量名称: {mps_data['var_names']}")
+        
         # Create node features
         # Variable nodes: [objective coefficient, lower bound, upper bound, is_binary, is_integer]
         var_features = torch.zeros((n_vars, 5))
@@ -198,12 +207,15 @@ def create_bipartite_graph(mps_data: Dict) -> Tuple[torch.Tensor, torch.Tensor, 
         var_features[:, 1] = torch.tensor([bound[0] for bound in mps_data['bounds']], dtype=torch.float)
         var_features[:, 2] = torch.tensor([bound[1] for bound in mps_data['bounds']], dtype=torch.float)
         
-        # Add binary and integer indicators
+        # 设置变量类型标志
         for i, var_type in enumerate(mps_data['var_types']):
+            print(f"处理变量 {i}: {var_type}")
             if var_type == 'binary':
                 var_features[i, 3] = 1.0
             elif var_type == 'integer':
                 var_features[i, 4] = 1.0
+        
+        print(f"变量特征:\n{var_features}")
         
         # Constraint nodes: [rhs value, is_equality, is_less_equal, is_greater_equal, is_objective]
         con_features = torch.zeros((n_cons, 5))
