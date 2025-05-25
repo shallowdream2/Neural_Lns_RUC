@@ -1,0 +1,26 @@
+{
+  "timestamp": "20250525_153928",
+  "processed": [
+    "air05.mps",
+    "drayage-25-23.mps",
+    "roll3000.mps",
+    "cvs16r128-89.mps",
+    "CMS750_4.mps",
+    "reblock115.mps",
+    "windfarm.mps",
+    "nu25-pr12.mps",
+    "nexp-150-20-8-5.mps",
+    "gmu-35-50.mps",
+    "rococoC11-010100.mps",
+    "drayage-100-23.mps",
+    "dano3_5.mps",
+    "dano3_3.mps",
+    "milo-v12-6-r2-40-1.mps",
+    "mcsched.mps"
+  ],
+  "failed": [
+    "dws008-01.mps",
+    "neos-3024952-loue.mps",
+    "fhnw-binpack4-48.mps"
+  ]
+}
