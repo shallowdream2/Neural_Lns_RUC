@@ -22,7 +22,11 @@ def print_solution_info(solutions, objectives, weights):
 def main():
     try:
         # 加载数据
+<<<<<<< HEAD
         with open("data/training_data.pkl", "rb") as f:
+=======
+        with open("data2/training_data.pkl", "rb") as f:
+>>>>>>> 42e945be271886e1f0207dd9abc54593ad37b2c2
             data = pickle.load(f)
         
         print(f"\n总实例数: {len(data)}")
@@ -39,7 +43,11 @@ def main():
             weights = instance['data']['weights']
             
             # 打印信息
+<<<<<<< HEAD
             #print_solution_info(solutions, objectives, weights)
+=======
+            print_solution_info(solutions, objectives, weights)
+>>>>>>> 42e945be271886e1f0207dd9abc54593ad37b2c2
             
             # 打印统计信息
             print(f"\n统计信息:")
