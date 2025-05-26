@@ -7,8 +7,12 @@
 import argparse, os, pickle, datetime, json
 import torch, numpy as np
 from graph_utils import load_mip_as_graph
+import config
 
-def main(data_dir: str, src="training_data.pkl"):
+# Determine the default source file based on config, then PREPROC_OUTPUT_FILE, then hardcoded default
+default_src_file = config.BUILD_GRAPH_INPUT_FILE if config.BUILD_GRAPH_INPUT_FILE is not None else (config.PREPROC_OUTPUT_FILE if config.PREPROC_OUTPUT_FILE is not None else "training_data.pkl")
+
+def main(data_dir: str, src=default_src_file):
     src_path = os.path.join(data_dir, src)
     with open(src_path, "rb") as f:
         data = pickle.load(f)
@@ -35,14 +39,20 @@ def main(data_dir: str, src="training_data.pkl"):
         enriched.append(inst)
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(data_dir, f"{ts}_graph.pkl")
+    
+    if config.GRAPH_DATASET_OUTPUT_FILE:
+        out_filename = config.GRAPH_DATASET_OUTPUT_FILE
+    else:
+        out_filename = f"{ts}_graph.pkl"
+        
+    out_path = os.path.join(data_dir, out_filename)
     with open(out_path, "wb") as f:
         pickle.dump(enriched, f)
     print(f"✓ graph‑dataset saved → {out_path}  (instances={len(enriched)})")
 
 if __name__ == "__main__":
     pa = argparse.ArgumentParser()
-    pa.add_argument("--data_dir", default="data")
-    pa.add_argument("--src_file", default="20250525_024919_3_instances.pkl")
+    pa.add_argument("--data_dir", default=config.DATA_DIR)
+    pa.add_argument("--src_file", default=default_src_file, help="Input pickle file from preprocessing. Default uses config, then dynamic, then training_data.pkl")
     args = pa.parse_args()
     main(args.data_dir, args.src_file)

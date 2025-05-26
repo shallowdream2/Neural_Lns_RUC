@@ -138,7 +138,7 @@ def build_bipartite_graph_neural_diving(mip_struct):
             le, eq, ge = 1.0, 0.0, 0.0
         elif np.isinf(c['rhs']):  # >= lhs
             le, eq, ge = 0.0, 0.0, 1.0
-        elif abs(c['lhs'] - c['rhs']) < 1e-9:  # == rhs
+        elif abs(c['lhs'] - c['rhs']) < 1e-6:  # == rhs
             le, eq, ge = 0.0, 1.0, 0.0
         else:  # range [lhs, rhs]
             le, eq, ge = 1.0, 0.0, 1.0

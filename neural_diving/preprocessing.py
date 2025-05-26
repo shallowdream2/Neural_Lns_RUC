@@ -4,11 +4,9 @@ import os
 import pickle
 from tqdm import tqdm
 from multiprocessing import Pool
-<<<<<<< HEAD
 import datetime # Import datetime module
 import json
-=======
->>>>>>> 42e945be271886e1f0207dd9abc54593ad37b2c2
+import config
 
 class SolutionCollector(Eventhdlr):
     def __init__(self, model, mip_path):
@@ -17,23 +15,16 @@ class SolutionCollector(Eventhdlr):
         self.mip_path = mip_path
         self.solutions = []
         self.obj_values = []
-        self.K = 100  # 设定收集解的数量
+        self.K = config.PREPROC_MAX_SOLUTIONS  # 设定收集解的数量
         self.model.setIntParam("limits/solutions", self.K)  # 设置最大解数量
         
         # 配置求解器参数
-<<<<<<< HEAD
-        self.model.setParam("limits/time", 120)
+        self.model.setParam("limits/time", config.PREPROC_TIME_LIMIT)
         #self.model.setIntParam("presolving/maxrounds",0)
 
         self.model.setParam("display/verblevel", 0) # 禁用详细输出
         self.model.setParam("presolving/maxrestarts", 0)
         # self.model.setParam("limits/gap", 0.0)
-=======
-        self.model.setParam("limits/time", 60)
-        # self.model.setParam("display/verblevel", 0) # 禁用详细输出
-        self.model.setParam("presolving/maxrestarts", 0)
-        self.model.setParam("limits/gap", 0.0)
->>>>>>> 42e945be271886e1f0207dd9abc54593ad37b2c2
         
         # 禁用LP相关输出
         self.model.setParam("display/lpinfo", False)
@@ -64,11 +55,8 @@ class SolutionCollector(Eventhdlr):
     def _post_process(self):
         # 去重并计算权重
         unique_sols, unique_objs = self._remove_duplicates()
-<<<<<<< HEAD
         if len(unique_sols)==0:
             return None
-=======
->>>>>>> 42e945be271886e1f0207dd9abc54593ad37b2c2
         weights = self._compute_weights(unique_objs)
         return {
             'solutions': unique_sols,
@@ -103,11 +91,8 @@ def process_single_mip(mip_path):
     model.readProblem(mip_path, "mps")
     model.optimize()
     result = collector._post_process()
-<<<<<<< HEAD
     if result is None:
         return None
-=======
->>>>>>> 42e945be271886e1f0207dd9abc54593ad37b2c2
     return {
             'instance': os.path.basename(mip_path),
             'data': result
@@ -116,14 +101,9 @@ def process_single_mip(mip_path):
 
 if __name__ == "__main__":
     # 配置参数
-<<<<<<< HEAD
-    MIP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mediate_data")
+    MIP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), config.DATA_DIR)
     # OUTPUT_FILE = "data2/training_data.pkl" # We will generate the filename dynamically
-=======
-    MIP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data2")
-    OUTPUT_FILE = "data2/training_data.pkl"
->>>>>>> 42e945be271886e1f0207dd9abc54593ad37b2c2
-    NUM_WORKERS = 1  # 并行进程数
+    NUM_WORKERS = config.PREPROC_NUM_WORKERS  # 并行进程数
 
     # 获取所有MIP文件路径
     mip_files = [os.path.join(MIP_DIR, f) for f in os.listdir(MIP_DIR) if f.endswith(".mps")]
@@ -133,27 +113,27 @@ if __name__ == "__main__":
     #     results = list(tqdm(p.imap(process_single_mip, mip_files), total=len(mip_files)))
     results = []
     for mip_path in tqdm(mip_files):
-<<<<<<< HEAD
         try: 
             result = process_single_mip(mip_path)
         except:
             continue
         if result is None:
             continue
-=======
-        result = process_single_mip(mip_path)
->>>>>>> 42e945be271886e1f0207dd9abc54593ad37b2c2
         results.append(result)
 
     # 过滤失败案例并保存
     valid_data = [r for r in results if r is not None]
-<<<<<<< HEAD
     
     # Generate dynamic filename based on timestamp and number of instances
     num_instances = len(valid_data)
     now = datetime.datetime.now()
     timestamp = now.strftime("%Y%m%d_%H%M%S") # Format: YYYYMMDD_HHMMSS
-    output_filename = f"{timestamp}_{num_instances}_instances.pkl" # English naming
+
+    if config.PREPROC_OUTPUT_FILE:
+        output_filename = config.PREPROC_OUTPUT_FILE
+    else:
+        output_filename = f"{timestamp}_{num_instances}_instances.pkl" # English naming
+        
     output_path = os.path.join(MIP_DIR, output_filename)
 
     # Save the data
@@ -193,33 +173,12 @@ if __name__ == "__main__":
     failed = [os.path.basename(f) for f in mip_files if
             os.path.basename(f) not in [d['instance'] for d in valid_data]]
 
-    summary_path = os.path.join(MIP_DIR, "preprocess_summary.json")
+    summary_path = os.path.join(MIP_DIR, config.PREPROC_SUMMARY_FILE)
     with open(summary_path, "w") as fw:
         json.dump({
             "timestamp": timestamp,
             "processed": [d['instance'] for d in valid_data],
             "failed": failed
         }, fw, indent=2)
+        
     print(f"✓ summary written to {summary_path}")
-=======
-    with open(OUTPUT_FILE, "wb") as f:
-        pickle.dump(valid_data, f)
-
-    # 打印统计信息
-    total_sols = sum(len(d['data']['solutions']) for d in valid_data)
-    print(f"Collected {total_sols} solutions from {len(valid_data)} instances")
-
-    # 加载保存的数据
-    with open("training_data.pkl", "rb") as f:
-        data = pickle.load(f)
-
-    # 访问第一个实例的数据
-    len_data = len(data)
-    for i in range(len_data):
-        print(f"第{i+1}个实例")
-        first_instance = data[i]
-        print(f"Instance: {first_instance['instance']}")
-        print(f"Solutions: {first_instance['data']['solutions']}")
-        print(f"Objectives: {first_instance['data']['objectives']}")
-        print(f"Weights: {first_instance['data']['weights']}")
->>>>>>> 42e945be271886e1f0207dd9abc54593ad37b2c2
