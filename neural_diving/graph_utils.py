@@ -1,86 +1,79 @@
 # src/graph_utils.py
 """
-Parse a single MPS file into bipartite‑graph tensors
----------------------------------------------------
-Returns
--------
-node_feat  : torch.Tensor [N_nodes, 6]   (5  original + 1  ID)
-edge_index : torch.Tensor [2, N_edges]
-edge_attr  : torch.Tensor [N_edges, 1]
-n_vars     : int                         -- number of variable nodes
-var_info   : list[dict]                  -- raw variable metadata
+Build bipartite graph with unified 5‑dim node features and 3‑dim edge features.
+Return:
+    node_feat : [N_nodes, 5]
+    edge_index: [2, E]
+    edge_attr : [E, 3]   (coef, coef_norm, sign)
+    n_vars    : int
+    var_info  : list[dict]
 """
-from typing import Dict, List, Tuple
-import torch
+import torch, math, numpy as np
+from torch_geometric.data import Data
 from read_mip import MIPParser
 
 
-# ---------- helper ----------
-def safe_norm(v: torch.Tensor) -> torch.Tensor:
-    """Normalize 1‑D tensor to [0,1]; replace NaN / ±inf with 0."""
-    v = torch.where(torch.isfinite(v), v, torch.zeros_like(v))
-    rng = v.max() - v.min()
-    return (v - v.min()) / rng if rng > 0 else v * 0.0
+# ---------- util ----------
+def min_max_norm(arr):
+    arr = np.asarray(arr, dtype=np.float32)
+    return (arr - arr.min()) / (arr.max() - arr.min() + 1e-9) if arr.ptp() > 1e-12 else np.zeros_like(arr)
 
 
 # ---------- main ----------
-def load_mip_as_graph(mps_path: str
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, List[Dict]]:
+def load_mip_as_graph(mps_path: str):
+    mip = MIPParser(mps_path).get_mip_structure()
+    vars_, cons_ = mip["variables"], mip["constraints"]
+    n_vars, n_cons = len(vars_), len(cons_)
 
-    parser = MIPParser(mps_path)
-    mip = parser.get_mip_structure()
-    vars_, cons = mip["variables"], mip["constraints"]
-    n_vars, n_cons = len(vars_), len(cons)
+    # ----- variable node feats (5) -----
+    obj_n = min_max_norm([v["obj"]            for v in vars_])
+    lb_n  = min_max_norm([v["lb"]             for v in vars_])
+    ub_n  = min_max_norm([v["ub"]             for v in vars_])
+    rc_n  = min_max_norm([v.get("reduced_cost", 0.) for v in vars_])
+    typemap = {"BINARY": 0., "INTEGER": 1., "CONTINUOUS": -1.}
 
-    # -------- variable features (5) --------
-    var_feat = torch.zeros((n_vars, 5), dtype=torch.float32)
-    for i, v in enumerate(vars_):
-        obj, lb, ub = v["obj"], v["lb"], v["ub"]
-        var_feat[i, 0] = obj
-        var_feat[i, 1] = lb if torch.isfinite(torch.tensor(lb)) else 0.0
-        var_feat[i, 2] = ub if torch.isfinite(torch.tensor(ub)) else 0.0
-        if v["vtype"] == "BINARY":
-            var_feat[i, 3] = 1.0
-        elif v["vtype"] == "INTEGER":
-            var_feat[i, 4] = 1.0
+    var_feats = [
+        [typemap[v["vtype"]], obj_n[i], lb_n[i], ub_n[i], rc_n[i]]
+        for i, v in enumerate(vars_)
+    ]
 
-    # numeric cols → normalize
-    for col in (0, 1, 2):
-        var_feat[:, col] = safe_norm(var_feat[:, col])
+    # ----- constraint node feats (5) -----
+    lhs_arr  = [c["lhs"] if math.isfinite(c["lhs"]) else 0. for c in cons_]
+    rhs_arr  = [c["rhs"] if math.isfinite(c["rhs"]) else 0. for c in cons_]
+    width_arr = [abs(r - l) for l, r in zip(lhs_arr, rhs_arr)]
 
-    # -------- constraint features (5) --------
-    con_feat = torch.zeros((n_cons, 5), dtype=torch.float32)
-    for i, c in enumerate(cons):
-        rhs = c["rhs"]
-        con_feat[i, 0] = rhs if torch.isfinite(torch.tensor(rhs)) else 0.0
-        if c["lhs"] == c["rhs"]:
-            con_feat[i, 1] = 1.0          # equality
-        elif c["lhs"] == -float("inf"):
-            con_feat[i, 2] = 1.0          # ≤
-        elif c["rhs"] ==  float("inf"):
-            con_feat[i, 3] = 1.0          # ≥
-    con_feat[:, 0] = safe_norm(con_feat[:, 0])
+    lhs_n  = min_max_norm(lhs_arr)
+    rhs_n  = min_max_norm(rhs_arr)
+    width_n = min_max_norm(width_arr)
 
-    # -------- merge & add node‑ID --------
-    node_features = torch.cat([var_feat, con_feat], dim=0)        # [N,5]
-    id_feat = torch.arange(node_features.size(0), dtype=torch.float32).unsqueeze(1)
-    id_feat /= node_features.size(0)                              # scale to [0,1]
-    node_features = torch.cat([node_features, id_feat], dim=1)    # [N,6]
+    cons_feats = []
+    for i, c in enumerate(cons_):
+        if math.isclose(c["lhs"], c["rhs"]):
+            ctype = 0.             # ==
+        elif math.isfinite(c["rhs"]):
+            ctype = 1.             # <=
+        else:
+            ctype = -1.            # >=
+        cons_feats.append([ctype, lhs_n[i], rhs_n[i], width_n[i], 0.])   # pad 0
 
-    # -------- edges --------
-    edges, coeffs = [], []
-    for i, c in enumerate(cons):
-        for j, vname in enumerate(c["vars"]):
-            v_idx = next(k for k, v in enumerate(vars_) if v["name"] == vname)
-            edges.append([v_idx, i + n_vars])          # var → cons
-            edges.append([i + n_vars, v_idx])          # cons → var ★
-            coeffs.append(c["coeffs"][j])
-            coeffs.append(c["coeffs"][j])              # ★ 为反向边复用同系数
-    if edges:
-        edge_index = torch.tensor(edges, dtype=torch.long).t()      # [2,E]
-        edge_attr  = torch.tensor(coeffs, dtype=torch.float32).unsqueeze(1)
-    else:
-        edge_index = torch.zeros((2, 0), dtype=torch.long)
-        edge_attr  = torch.zeros((0, 1), dtype=torch.float32)
+    # ----- edges (dual‑direction) -----
+    edge_src, edge_dst, edge_attr = [], [], []
+    row_max = [max(abs(a) for a in c["coeffs"]) or 1. for c in cons_]
+    name2idx = {v["name"]: i for i, v in enumerate(vars_)}
 
-    return node_features, edge_index, edge_attr, n_vars, vars_
+    for ci, c in enumerate(cons_):
+        m = row_max[ci]
+        for vname, coef in zip(c["vars"], c["coeffs"]):
+            vi = name2idx[vname]
+            sign = 1. if coef < 0 else 0.
+            attr = [coef, coef / m, sign]
+            edge_src += [vi, n_vars + ci]
+            edge_dst += [n_vars + ci, vi]
+            edge_attr += [attr, attr]
+
+    edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
+    edge_attr  = torch.tensor(edge_attr, dtype=torch.float32)
+    x = torch.tensor(var_feats + cons_feats, dtype=torch.float32)
+
+    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, num_vars=n_vars)
+    return data.x, data.edge_index, data.edge_attr, n_vars, vars_

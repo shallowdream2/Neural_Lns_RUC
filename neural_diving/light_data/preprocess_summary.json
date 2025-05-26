@@ -1,0 +1,26 @@
+{
+  "timestamp": "20250527_011143",
+  "processed": [
+    "roll3000.mps",
+    "lotsize.mps",
+    "cvs16r128-89.mps",
+    "ran14x18-disj-8.mps",
+    "gmu-35-40.mps",
+    "nu25-pr12.mps",
+    "3v2c.mps",
+    "csched007.mps",
+    "gmu-35-50.mps",
+    "mik-250-20-75-4.mps",
+    "csched008.mps",
+    "mas74.mps",
+    "milo-v12-6-r2-40-1.mps",
+    "mcsched.mps"
+  ],
+  "failed": [
+    "fhnw-binpack4-4.mps",
+    "neos859080.mps",
+    "neos-3024952-loue.mps",
+    "fhnw-binpack4-48.mps",
+    "assign1-5-8.mps"
+  ]
+}

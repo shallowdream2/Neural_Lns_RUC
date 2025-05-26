@@ -1,14 +1,14 @@
 # Config for Neural_Lns_RUC project
 
 # Paths
-DATA_DIR = "mediate_data"
+DATA_DIR = "light_data"
 MODEL_DIR = "models"
 
 # train_diving_gcn.py hyperparameters
-TRAIN_INPUT_DIM = 6
+TRAIN_INPUT_DIM = 5
 TRAIN_HIDDEN_DIM = 128
 TRAIN_OUTPUT_DIM = 1
-TRAIN_N_EPOCHS = 100
+TRAIN_N_EPOCHS = 2
 TRAIN_LR = 1e-2
 TRAIN_N_BITS = 8 # Assuming n_bits from DivingGCN init
 
