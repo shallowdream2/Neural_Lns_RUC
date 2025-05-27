@@ -1,24 +1,23 @@
 # src/train_diving_gcn.py
 # --------------------------------------------
 # 使用 *_graph.pkl 数据集直接训练 DivingGCN
+# 每 CKPT_INTERVAL 个 epoch 保存一次 checkpoint
+# 并支持 --resume 继续训练
 # --------------------------------------------
 
-
-import os, pickle, torch
+import os, pickle, torch, argparse
 from tqdm import tqdm
 from typing import List, Dict
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from diving_gcn_gpu import DivingGCN, integer_to_binary_bits,get_device     # 你的模型实现
+
+from diving_gcn_gpu import DivingGCN, integer_to_binary_bits, get_device
 import config
 
-# train_model 在本文件末尾，若已有独立 utils 可自行替换
 # ------------------------------------------------------------
 # 1. 读取 *_graph.pkl
 # ------------------------------------------------------------
-
-
 def load_graph_dataset(data_dir: str, graph_pkl: str, device=None):
     device = get_device() if device is None else device
     with open(os.path.join(data_dir, graph_pkl), "rb") as f:
@@ -43,7 +42,7 @@ def load_graph_dataset(data_dir: str, graph_pkl: str, device=None):
 # ------------------------------------------------------------
 # 2. 主训练入口
 # ------------------------------------------------------------
-def train():
+def train(resume_ckpt: str | None = None):
     base_dir  = os.path.dirname(os.path.abspath(__file__))
     data_dir  = os.path.join(base_dir, config.DATA_DIR)
     model_dir = os.path.join(base_dir, config.MODEL_DIR)
@@ -52,43 +51,58 @@ def train():
     # 选择数据集
     if config.TRAIN_INPUT_FILE:
         graph_pkl = config.TRAIN_INPUT_FILE
-        print(f"✓ 使用配置文件指定的数据集: {graph_pkl}")
-        if not os.path.exists(os.path.join(data_dir, graph_pkl)):
-            raise FileNotFoundError(f"找不到指定的 pkl：{graph_pkl}")
     else:
         graph_files = sorted(f for f in os.listdir(data_dir) if f.endswith("_graph.pkl"))
         assert graph_files, "目录下没有 *_graph.pkl，请先生成"
         graph_pkl = graph_files[-1]
-        print("✓ 使用最新的数据集:", graph_pkl)
+    print(f"✓ 使用数据集: {graph_pkl}")
 
     nfeat, eidx, eattr, nvars, vinfo, sols, wts = load_graph_dataset(data_dir, graph_pkl)
 
     # ------------ 模型 ------------
     device = get_device()
     model = DivingGCN(
-        input_dim=config.TRAIN_INPUT_DIM,      # ← 请在 config.py 中设为 6
+        input_dim=config.TRAIN_INPUT_DIM,
         hidden_dim=config.TRAIN_HIDDEN_DIM,
         output_dim=config.TRAIN_OUTPUT_DIM,
-        n_bits=config.TRAIN_N_BITS
+        n_bits=config.TRAIN_N_BITS,
+        edge_input_dim=3
     ).to(device)
 
+    optimizer = torch.optim.Adam(model.parameters(),
+                                 lr=config.TRAIN_LR, weight_decay=1e-4)
+
+    start_epoch = 1
+    # ------------ 断点恢复 ------------
+    if resume_ckpt:
+        ckpt = torch.load(resume_ckpt, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optim_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        print(f"✓ 从 checkpoint 恢复: {resume_ckpt} (epoch {ckpt['epoch']})")
+
+    # ------------ 训练 ------------
     model = train_model(
-        model, nfeat, eidx, eattr,
+        model, optimizer,
+        nfeat, eidx, eattr,
         sols, wts, vinfo, nvars,
+        start_epoch=start_epoch,
         n_epochs=config.TRAIN_N_EPOCHS,
-        lr=config.TRAIN_LR
+        ckpt_dir=model_dir,
+        ckpt_interval=getattr(config, "CKPT_INTERVAL", 10)
     )
 
+    # 训练完保存最终模型
     save_name = config.TRAIN_MODEL_SAVE_NAME or "diving_gcn.pt"
-    save_path = os.path.join(model_dir, save_name)
-    torch.save({"model_state_dict": model.state_dict()}, save_path)
-    print("✓ 模型已保存 →", save_path)
+    torch.save({"model_state_dict": model.state_dict()}, os.path.join(model_dir, save_name))
+    print("✓ 最终模型已保存 →", save_name)
 
 
 # ------------------------------------------------------------
-# 3. 训练循环（调试信息全部保留）
+# 3. 训练循环
 # ------------------------------------------------------------
 def train_model(model: nn.Module,
+                optimizer: torch.optim.Optimizer,
                 node_features_list: List[torch.Tensor],
                 edge_index_list:   List[torch.Tensor],
                 edge_attr_list:    List[torch.Tensor],
@@ -96,18 +110,19 @@ def train_model(model: nn.Module,
                 weights_list:      List[torch.Tensor],
                 var_info_list:     List[List[Dict]],
                 n_vars_list:       List[int],
+                *,
+                start_epoch: int,
                 n_epochs: int,
-                lr: float) -> nn.Module:
+                ckpt_dir: str,
+                ckpt_interval: int) -> nn.Module:
 
     torch.autograd.set_detect_anomaly(True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     n_bits = model.n_bits
+    device = node_features_list[0].device if node_features_list else get_device()
 
-    for epoch in range(1, n_epochs + 1):
+    for epoch in range(start_epoch, n_epochs + 1):
         model.train()
-        total_batch_loss = torch.zeros(
-            (), device=assignments_list[0].device if assignments_list else "cpu"
-        )
+        total_batch_loss = torch.zeros((), device=device)
 
         for i in range(len(assignments_list)):
             node_feat  = node_features_list[i]
@@ -118,35 +133,34 @@ def train_model(model: nn.Module,
             var_info   = var_info_list[i]
             n_vars     = n_vars_list[i]
 
-            # ---- 前向 ----
             logits = model(node_feat, eidx, n_vars, edge_attr=eattr)
-            print(f"logits:{logits}")   # 调试输出保留
+            print(f"logits:{logits}")   # 调试输出
             assert not torch.isnan(logits).any(), f"NaN logits (inst {i})"
 
             if assigns.numel() == 0:
-                continue  # 跳过无解实例
+                continue
 
-            inst_loss = torch.zeros((), device=node_feat.device)
+            inst_loss = torch.zeros((), device=device)
 
             for j in range(assigns.size(0)):
                 sol = assigns[j]
                 w   = torch.nan_to_num(weights[j], nan=1.0, posinf=1.0, neginf=1.0)
                 w   = w.clamp_(1e-6, 1.0).detach()
 
-                sol_loss = torch.zeros((), device=node_feat.device)
+                sol_loss = torch.zeros((), device=device)
                 for vidx in range(n_vars):
                     if var_info[vidx]["vtype"] not in ["BINARY", "INTEGER"]:
                         continue
 
                     val = int(sol[vidx].item())
                     lb, ub = int(var_info[vidx]["lb"]), int(var_info[vidx]["ub"])
-                    target = integer_to_binary_bits(val, lb, ub, n_bits).to(node_feat.device)
+                    target = integer_to_binary_bits(val, lb, ub, n_bits).to(device)
 
                     bit_logits = logits[vidx].clamp(-10, 10)
                     per_bit    = F.binary_cross_entropy_with_logits(bit_logits, target, reduction="none")
-                    bit_weights = torch.tensor([2 ** k for k in range(per_bit.size(0))],
-                                               dtype=per_bit.dtype, device=node_feat.device)
-                    sol_loss += torch.sum(per_bit * bit_weights)
+                    bw         = torch.tensor([2 ** k for k in range(per_bit.size(0))],
+                                              dtype=per_bit.dtype, device=device)
+                    sol_loss += torch.sum(per_bit * bw)
 
                 inst_loss += sol_loss * w
 
@@ -162,9 +176,25 @@ def train_model(model: nn.Module,
         with open("loss.txt", "a") as fw:
             fw.write(f"Epoch {epoch},{total_batch_loss.item():.6f}\n")
 
+        # ---- 周期性 checkpoint ----
+        if ckpt_interval and epoch % ckpt_interval == 0:
+            ckpt_path = os.path.join(ckpt_dir, f"ckpt_epoch_{epoch}.pt")
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optim_state_dict": optimizer.state_dict()
+            }, ckpt_path)
+            print(f"  ↳ checkpoint saved @ {ckpt_path}")
+
     return model
 
 
 # ------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    train()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--resume", default=None,
+                    help="checkpoint path to resume training")
+    args = ap.parse_args()
+    train(resume_ckpt=args.resume)
