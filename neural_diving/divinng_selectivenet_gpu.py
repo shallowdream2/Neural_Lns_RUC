@@ -35,48 +35,54 @@ sys.path.append(cur_dir)
 # --------------------------------------------------------------------------- #
 # 2. Model definition                                                         #
 # --------------------------------------------------------------------------- #
-class DivingGCN(nn.Module):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+
+class DivingGCN_selective(nn.Module):
     def __init__(self,
-                 input_dim:  int = 5,          # ★ 统一 5 维节点特征
+                 input_dim: int = 5,
                  hidden_dim: int = 128,
-                 output_dim: int = 1,          # (unused – logits = n_bits)
-                 n_bits:     int = 8,
-                 edge_input_dim: int = 3):     # ★ new – edge feature dims
+                 output_dim: int = 1,  # (unused – logits = n_bits)
+                 n_bits: int = 8,
+                 edge_input_dim: int = 3):
         super().__init__()
         self.n_bits = n_bits
 
-        # (a) node linear projection
+        # Node projection
         self.in_proj = nn.Linear(input_dim, hidden_dim)
 
-        # (b) edge‑attribute encoder – now accepts 3‑D input
+        # Edge attribute encoder
         self.edge_mlp = nn.Sequential(
-            nn.Linear(edge_input_dim, hidden_dim),   # ★ was 1 → 3
+            nn.Linear(edge_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
 
-        # (c) 3‑layer GCN
+        # GCN layers
         self.conv1 = GCNConv(hidden_dim, hidden_dim, normalize=False)
         self.conv2 = GCNConv(hidden_dim, hidden_dim, normalize=False)
         self.conv3 = GCNConv(hidden_dim, hidden_dim, normalize=False)
 
-        # (d) bit predictor
+        # Prediction head (bit prediction)
         self.var_bit_pred = nn.Linear(hidden_dim, n_bits)
 
-    def forward(self,
-                x: torch.Tensor,            # [N, F]
-                edge_index: torch.Tensor,   # [2, E]
-                n_var_nodes: int,
-                edge_attr: torch.Tensor):   # [E, 3]
+        # Selection head (SelectiveNet's g(x))
+        self.selection_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
 
-        # initial projection
-        x = self.in_proj(x)                 # [N, H]
+    def forward(self, x, edge_index, n_var_nodes, edge_attr):
+        # Initial projection
+        x = self.in_proj(x)
 
-        # edge message  φ(e) ⊙ h_src
+        # Edge message passing
         row, col = edge_index
-        edge_msg = self.edge_mlp(edge_attr) * x[row]     # [E, H]
-
-        # aggregate to target nodes
+        edge_msg = self.edge_mlp(edge_attr) * x[row]
         agg = torch.zeros_like(x)
         agg.index_add_(0, col, edge_msg)
         x = x + agg
@@ -86,9 +92,59 @@ class DivingGCN(nn.Module):
         x = F.relu(self.conv2(x, edge_index))
         x = F.relu(self.conv3(x, edge_index))
 
-        # logits for variable nodes
-        return self.var_bit_pred(x[:n_var_nodes])        # [n_var, n_bits]
+        # Get node features for variable nodes
+        var_features = x[:n_var_nodes]
 
+        # Two outputs: bit predictions and selection scores
+        bit_logits = self.var_bit_pred(var_features)  # [n_var, n_bits]
+        selection_scores = self.selection_head(var_features).squeeze(-1)  # [n_var]
+
+        return bit_logits, selection_scores
+
+def selective_loss(bit_logits, selection_scores, targets, C=0.8, lambda_=1.0):
+    """
+    Compute selective loss from equation (16)
+    
+    Args:
+        bit_logits: [n_var, n_bits] 未归一化的预测值
+        selection_scores: [n_var] 每个节点的选择概率 (0~1)
+        targets: [n_var, n_bits] 真实标签 (0/1)
+        C: 目标覆盖率
+        lambda_: 约束项的权重
+    """
+    n_var, n_bits = bit_logits.shape
+    
+    # 计算预测损失 (仅覆盖样本)
+    pred_probs = torch.sigmoid(bit_logits)
+    binary_pred = (pred_probs > 0.5).float()
+    # correct_mask = (binary_pred == targets).float()  # 正确预测的掩码
+    
+    # 交叉熵损失 (按选择分数加权)
+    # print(f"[DEBUG] bit_logits shape: {bit_logits.shape}, targets shape: {targets.shape}, selection_scores shape: {selection_scores.shape}")
+    ce_loss = F.binary_cross_entropy_with_logits(
+        bit_logits, targets, reduction='none'
+    )  # [n_var, n_bits]
+    weighted_ce = (ce_loss * selection_scores.unsqueeze(-1)).sum()
+    denominator = (selection_scores.sum() * n_bits + 1e-8)
+    pred_term = weighted_ce / denominator
+
+    # 覆盖率约束
+    coverage = selection_scores.mean()  # 实际覆盖率
+    penalty = F.relu(C - coverage) ** 2  # 仅惩罚不足的覆盖率
+    constraint_term = lambda_ * penalty
+
+    # 总损失
+    total_loss = pred_term + constraint_term
+    
+    # 附加监控指标
+    metrics = {
+        "loss": total_loss.item(),
+        "ce_loss": pred_term.item(),
+        "coverage": coverage.item(),
+        "penalty": constraint_term.item()
+    }
+    
+    return total_loss, metrics
 # --------------------------------------------------------------------------- #
 # 3. Helper functions                                                         #
 # --------------------------------------------------------------------------- #
@@ -174,16 +230,3 @@ def to_device(model: nn.Module,
             moved.append(t)
     return moved if len(moved) > 1 else moved[0]
 
-# --------------------------------------------------------------------------- #
-# 5. Quick sanity check                                                       #
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    N, E, n_vars, F, Fe = 12, 30, 5, 5, 3
-    x   = torch.randn(N, F)
-    ei  = torch.randint(0, N, (2, E))
-    ea  = torch.randn(E, Fe)
-
-    net = DivingGCN(input_dim=F, edge_input_dim=Fe)
-    x, ei, ea = to_device(net, x, ei, ea)
-    out = net(x, ei, n_vars, ea)
-    print("logits:", out.shape)   # [5, 8]
