@@ -16,7 +16,7 @@ class SolutionCollector(Eventhdlr):
         self.model.setIntParam("limits/solutions", self.K)  # 设置最大解数量
         
         # 配置求解器参数
-        self.model.setParam("limits/time", 60)
+        self.model.setParam("limits/time", 120)
         self.model.setParam("display/verblevel", 0)
         self.model.setParam("presolving/maxrestarts", 0)
         self.model.setParam("limits/gap", 0.0)
@@ -83,8 +83,22 @@ def process_single_mip(mip_path):
     result = collector._post_process()
     return {
             'instance': os.path.basename(mip_path),
+            'num_solutions': len(result['solutions']),
             'data': result
     }
+    
+import json
+
+def numpy_to_list(data):
+    """递归将数据中的numpy数组转为list，便于json序列化"""
+    if isinstance(data, np.ndarray):
+        return data.tolist()
+    elif isinstance(data, dict):
+        return {k: numpy_to_list(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [numpy_to_list(v) for v in data]
+    else:
+        return data
     
 
 if __name__ == "__main__":
@@ -100,29 +114,30 @@ if __name__ == "__main__":
     # with Pool(NUM_WORKERS) as p:
     #     results = list(tqdm(p.imap(process_single_mip, mip_files), total=len(mip_files)))
     results = []
-    for mip_path in tqdm(mip_files):
+    for mip_path in mip_files:
         result = process_single_mip(mip_path)
         results.append(result)
 
     # 过滤失败案例并保存
     valid_data = [r for r in results if r is not None]
-    with open(OUTPUT_FILE, "wb") as f:
-        pickle.dump(valid_data, f)
+    # 保存为json
+    with open("training_data.json", "w", encoding="utf-8") as f:
+        json.dump(numpy_to_list(valid_data), f, ensure_ascii=False, indent=2)
 
     # 打印统计信息
     total_sols = sum(len(d['data']['solutions']) for d in valid_data)
     print(f"Collected {total_sols} solutions from {len(valid_data)} instances")
 
-    # 加载保存的数据
-    with open("training_data.pkl", "rb") as f:
-        data = pickle.load(f)
+    # # 加载保存的数据
+    # with open("training_data.json", "r", encoding="utf-8") as f:
+    #     data = json.load(f)
 
-    # 访问第一个实例的数据
-    len_data = len(data)
-    for i in range(len_data):
-        print(f"第{i+1}个实例")
-        first_instance = data[i]
-        print(f"Instance: {first_instance['instance']}")
-        print(f"Solutions: {first_instance['data']['solutions']}")
-        print(f"Objectives: {first_instance['data']['objectives']}")
-        print(f"Weights: {first_instance['data']['weights']}")
+    # # 访问第一个实例的数据
+    # len_data = len(data)
+    # for i in range(len_data):
+    #     print(f"第{i+1}个实例")
+    #     first_instance = data[i]
+    #     print(f"Instance: {first_instance['instance']}")
+    #     print(f"Solutions: {first_instance['data']['solutions']}")
+    #     print(f"Objectives: {first_instance['data']['objectives']}")
+    #     print(f"Weights: {first_instance['data']['weights']}")

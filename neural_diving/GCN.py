@@ -134,3 +134,22 @@ class NeuralDivingNet(nn.Module):
         bern_logits = self.bernoulli_head(var_h)            # [num_vars]
         cat_logits  = self.categorical_head(var_h)          # list of [K_i] each
         return bern_logits, cat_logits
+
+
+class NeuralDivingNetTrainer:
+    def __init__(self, model: NeuralDivingNet, optimizer: torch.optim.Optimizer):
+        self.model = model
+        self.optimizer = optimizer
+
+    def train_step(self, data):
+        self.optimizer.zero_grad()
+        bern_logits, cat_logits = self.model(data)
+        loss = self.compute_loss(bern_logits, cat_logits, data)
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
+
+    def compute_loss(self, bern_logits, cat_logits, data):
+        # 计算损失函数
+        # 这里需要根据具体的任务和数据格式来实现
+        pass
